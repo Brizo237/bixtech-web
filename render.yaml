@@ -10,3 +10,5 @@ services:
     envVars:
       - key: SESSION_SECRET
         generateValue: true
+      - key: ADMIN_PASSWORD   # Render asks for this value when you apply the Blueprint
+        sync: false

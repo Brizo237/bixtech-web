@@ -39,6 +39,23 @@ Put each value in `.env`. Register the callback URL **exactly** (shown for local
 
 Notes: Apple refuses `localhost`, so test it only after deploying with https. Facebook apps in Development mode accept only you and added testers. Start with Google or GitHub, which are the quickest.
 
+## One-tap sign-in for students (email code + Face ID)
+
+Students no longer fill in a long form. The screen offers the five provider buttons, a **Face ID** button (shown on devices that support it), and **a 6-digit code sent to their email**. The first sign-in creates the account automatically.
+
+**Email codes need a free Brevo account (about 10 minutes):**
+1. Sign up at brevo.com (free plan: 300 emails a day).
+2. Open **Senders, Domains & Dedicated IPs → Senders → Add a sender**. Use an email address you own and click the verification link Brevo emails you.
+3. Open **SMTP & API → API Keys → Generate a new API key** and copy it.
+4. In Render, **Environment**, add `BREVO_API_KEY` (the key) and `MAIL_FROM` (the sender address you verified). Save.
+A Gmail sender can land in the recipients' spam folder. Your own domain with Brevo's DNS records delivers better. WhatsApp codes are not included: they need Meta's WhatsApp Business API, which is not free or quick to set up.
+
+**Face ID / fingerprint (passkeys)** needs no credentials. After a student signs in once (provider or email code), they tap **Enable Face ID** at the top of the app. Next time, **Sign in with Face ID** works with one look. It works on iPhone (Safari or Chrome), Android and modern laptops, over https only, and not inside in-app browsers such as the Facebook or Instagram browser. Passkeys belong to the website address: if you move to a new address (for example bixtech.cm), students enable Face ID again.
+
+**Keep accounts and Face ID permanently (free, Upstash):** a free host wipes its disk when it restarts, which would erase saved Face IDs. Make a free account at upstash.com, create a **Redis** database, copy its **REST URL** and **REST Token**, and add them in Render as `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`. I tested this storage against a stand-in, not against Upstash itself, so check that a Face ID survives a restart after you set it up.
+
+The old email-and-password form still exists under "Sign in with a password instead", so existing password accounts keep working. The Register tab is gone.
+
 ## Free hosting that works today: Render (no Google account needed)
 
 Render's free plan runs this server. Most sources say no card is needed, though one reports a small card check, so just try it. Limits you should accept: the site **sleeps after 15 minutes without visitors** and takes about a minute to wake up, and its disk is wiped on every sleep (logins use signed cookies, so they survive; the small server-side account list does not, and people simply sign in again). That sleep also makes it a poor fit for Google search visibility later. A paid instance (about $7/month) removes it.
@@ -136,3 +153,50 @@ Authorization-code flow with one-time `state` kept in a signed HttpOnly cookie, 
 ## Known limits
 
 Student data and email/password accounts still live in each browser's storage (original design). Accounts from social login are stored in `data/store.json` on the server. Forgot password opens an email to bixtech3@gmail.com. The Terms of Service text is a placeholder.
+
+## Internship application forms (student upload + admin review)
+
+Students upload the **school's own application form** (photo or PDF) from the **Application** tab. Admins review it in **Applications**.
+
+**Set up (3 steps)**
+1. Add `ADMIN_PASSWORD` (8+ characters) to `.env` or Render's Environment. Without it the admin side stays locked on purpose.
+2. Restart `node server.js`. The terminal prints `Admin review: READY` and where files are kept.
+3. Sign in as admin, tap **Applications**, enter the admin email and this password.
+
+**Where files go:** `DATA_DIR/uploads/`, or Upstash when `UPSTASH_REDIS_REST_URL/TOKEN` are set. A free Render disk is wiped on restart, so use Upstash (free plan 256 MB) or a Cloud Run bucket (`DATA_DIR=/data`). If a file is lost the admin sees a clear message and can reject it so the student re-uploads.
+
+**APIs** (JSON; uploads and POSTs need the `X-Requested-With: fetch` header)
+
+| Method and path | Who | What |
+|---|---|---|
+| `POST /api/applications` | student | raw file body (JPG/PNG/PDF); headers `Content-Type`, `X-File-Name` |
+| `GET /api/applications/mine` | student | my application and status, or `null` |
+| `GET /api/applications/mine/file` | student | my uploaded file |
+| `GET /api/admin/session` | anyone | `{admin, configured}` |
+| `POST /api/admin/login`, `/api/admin/logout` | admin | server sign-in (8 hours; 8 tries per 10 min) |
+| `GET /api/admin/applications?status=&q=` | admin | list and counts |
+| `GET /api/admin/applications/:id` | admin | one application |
+| `GET /api/admin/applications/:id/file[?download=1]` | admin | view or download the original |
+| `POST /api/admin/applications/:id/review` | admin | `{decision: "approved" or "rejected", comment}`; comment required to reject |
+
+Tests: `node --test`.
+
+## Setting up Brevo (the emails with the 6-digit code)
+
+1. Create a free account at brevo.com.
+2. **Add a sender:** Senders, Domains & Dedicated IPs > Senders > Add a sender. Use an address you own (for example your Gmail). Brevo emails you a link: click it to verify.
+3. **Make an API key:** top-right menu > SMTP & API > API Keys > Generate a new API key. Copy it once.
+4. Run `node setup.js` (creates `.env`), then open `.env` and fill in:
+   `BREVO_API_KEY=` the key you copied, and `MAIL_FROM=` the exact sender address from step 2.
+5. If your key is blocked: Security > Authorised IPs > turn off the blocking (or add your server's IP).
+6. **Test it:** `node check-mail.js your-own-email@gmail.com`. It prints `OK`, or says exactly what to fix.
+7. On Render, add the same two values (plus `ADMIN_PASSWORD`) in Environment, then redeploy.
+
+## Student sign up and sign in (passwords, no email code)
+
+- **Sign up:** name, email, password (8+), course, field, duration, then the school form (photo or PDF). The account is created, the student is signed in, and the form is sent as **Pending**.
+- **Sign in:** email + password. Google / Apple / GitHub / Facebook buttons still work if you configured them.
+- Passwords are stored only as salted scrypt hashes on the server. 8 wrong tries per 10 minutes are blocked.
+- Old accounts that only existed in one browser are moved to the server the first time that student signs in (password 8+ characters).
+- **Forgot password** still opens an email to your contact address; reset it by asking the student to sign up again with another email, or ask me to add an admin reset button.
+- API: `POST /auth/register`, `POST /auth/login` (JSON). Brevo is now only needed for the optional email-code fallback.

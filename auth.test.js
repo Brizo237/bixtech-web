@@ -9,6 +9,7 @@ const path = require('node:path');
 
 process.env.PORT = '0';
 process.env.RATE_LIMIT = '1000';
+process.env.BREVO_API_KEY = 'brevo-key'; process.env.MAIL_FROM = 'noreply@bixtech.test';
 process.env.BASE_URL = 'http://localhost:3000';
 process.env.SESSION_SECRET = 'x'.repeat(40);
 process.env.DATA_DIR = path.join(os.tmpdir(), 'bix-test-' + process.pid);
@@ -26,11 +27,13 @@ const jwk = Object.assign(rsa.publicKey.export({ format: 'jwk' }), { kid: 'k1', 
 // ---- fake provider responses (the server's outgoing fetch is intercepted)
 let fake = {};
 let lastApple = {};
+let lastMail = null; let mailFails = false;
 const realFetch = global.fetch;
 global.fetch = async (url, opts = {}) => {
   url = String(url);
   const json = (o, status = 200) => ({ ok: status < 300, status, text: async () => JSON.stringify(o) });
   if (url.startsWith('http://127.0.0.1')) return realFetch(url, opts);
+  if (url === 'https://api.brevo.com/v3/smtp/email') { if (mailFails) return json({ message: 'bad' }, 401); lastMail = JSON.parse(opts.body); return json({ messageId: 'm1' }); }
   if (url === 'https://oauth2.googleapis.com/token') return json({ access_token: 'g-at' });
   if (url === 'https://openidconnect.googleapis.com/v1/userinfo') return json(fake.google);
   if (url === 'https://github.com/login/oauth/access_token') return json({ access_token: 'h-at' });
@@ -208,4 +211,55 @@ test('SEO: robots.txt, sitemap.xml, filled-in canonical + JSON-LD, 404 page, noi
   assert.match(map.body, /<loc>http:\/\/localhost:3000\/<\/loc>/);
   assert.equal((await req('GET', '/api/me')).headers['x-robots-tag'], 'noindex, nofollow');
   assert.equal((await req('GET', '/definitely-missing')).status, 404);
+});
+
+const JSONH = { 'content-type': 'application/json', 'x-requested-with': 'fetch' };
+const post = (p, obj, cookie) => req('POST', p, { headers: Object.assign({}, JSONH, cookie ? { cookie } : {}), body: JSON.stringify(obj) });
+const codeFromMail = () => lastMail.textContent.match(/code is (\d{6})/)[1];
+
+test('email code: sends a 6-digit code, signs in, creates the account, code works once', async () => {
+  const feat = JSON.parse((await req('GET', '/api/providers')).body).features;
+  assert.equal(feat.emailCode, true); assert.equal(feat.passkey, true);
+  const start = await post('/auth/email/start', { email: 'Student@Example.com', name: 'Ada Student' });
+  assert.equal(start.status, 200);
+  assert.equal(lastMail.to[0].email, 'student@example.com');
+  assert.match(lastMail.subject, /sign-in code/);
+  const code = codeFromMail();
+  const otp = jar(start);
+  const ok = await post('/auth/email/verify', { code }, otp);
+  assert.equal(ok.status, 200);
+  assert.equal(JSON.parse(ok.body).user.name, 'Ada Student');
+  const me = JSON.parse((await req('GET', '/api/me', { headers: { cookie: jar(ok) } })).body);
+  assert.equal(me.user.email, 'student@example.com');
+  assert.equal((await post('/auth/email/verify', { code }, otp)).status, 400); // replay refused
+});
+
+test('email code: wrong code, lockout after 5 tries, CSRF header, throttle, mail failure', async () => {
+  const start = await post('/auth/email/start', { email: 'lock@example.com' });
+  const otp = jar(start); const real = codeFromMail(); const wrong = real === '000000' ? '111111' : '000000';
+  for (let i = 0; i < 5; i++) assert.equal((await post('/auth/email/verify', { code: wrong }, otp)).status, 400);
+  assert.equal((await post('/auth/email/verify', { code: real }, otp)).status, 429); // locked even with the right code
+  assert.equal((await post('/auth/email/start', { email: 'lock@example.com' })).status, 429); // resend throttle
+  assert.equal((await req('POST', '/auth/email/start', { headers: { 'content-type': 'application/json' }, body: '{"email":"a@b.co"}' })).status, 403);
+  assert.equal((await post('/auth/email/start', { email: 'not-an-email' })).status, 400);
+  mailFails = true;
+  assert.equal((await post('/auth/email/start', { email: 'fail@example.com' })).status, 502);
+  mailFails = false;
+  assert.equal((await post('/auth/email/verify', { code: '123456' })).status, 400); // no cookie
+});
+
+test('email code signs into the same account as a verified provider (no duplicate)', async () => {
+  fake.google = { sub: 'g-same', email: 'same@example.com', email_verified: true, name: 'Same Person' };
+  await login('google');
+  const start = await post('/auth/email/start', { email: 'same@example.com' });
+  await post('/auth/email/verify', { code: codeFromMail() }, jar(start));
+  assert.equal(store.users.filter((u) => u.email === 'same@example.com').length, 1);
+});
+
+test('passkey endpoints need a session to register, and refuse forged logins', async () => {
+  assert.equal((await post('/auth/passkey/register/options', {})).status, 401);
+  const o = await post('/auth/passkey/login/options', {});
+  assert.equal(JSON.parse(o.body).publicKey.userVerification, 'required');
+  const bad = await post('/auth/passkey/login/verify', { id: 'nope', response: { clientDataJSON: '', authenticatorData: '', signature: '' } }, jar(o));
+  assert.equal(bad.status, 400);
 });
